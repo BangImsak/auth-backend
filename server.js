@@ -9,11 +9,11 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 
 // -------------------- Firebase Admin Init --------------------
-const serviceAccount = require("./firebase-service-account.json"); // 👈 ชื่อไฟล์ key
+const serviceAccount = require('./firebase-service-account.json'); // 👈 ชื่อไฟล์ key
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DB_URL
+  databaseURL: process.env.FIREBASE_DB_URL,
 });
 
 const db = admin.database();
@@ -28,24 +28,16 @@ function isValidEmail(email) {
 }
 
 function isStrongPassword(password) {
-  // แค่ตัวอย่างง่าย ๆ: อย่างน้อย 6 ตัว
+  // ตัวอย่างง่าย ๆ: อย่างน้อย 6 ตัว
   return typeof password === 'string' && password.length >= 6;
 }
 
 // -------------------- Routes --------------------
 
-// 1) สมัครสมาชิก
-// POST /api/register
+// 1) สมัครสมาชิก (ต้องไปยืนยันอีเมลก่อนถึงจะใช้งานได้)
 app.post('/api/register', async (req, res) => {
   try {
-    const {
-      firstName,
-      lastName,
-      gender,
-      dateOfBirth,
-      email,
-      password,
-    } = req.body;
+    const { firstName, lastName, gender, dateOfBirth, email, password } = req.body;
 
     // ----- ตรวจสอบข้อมูลเบื้องต้น -----
     if (!firstName || !lastName || !gender || !dateOfBirth || !email || !password) {
@@ -68,31 +60,59 @@ app.post('/api/register', async (req, res) => {
     });
 
     const uid = userRecord.uid;
-
-    // ----- บันทึกโปรไฟล์ลง Realtime Database -----
     const now = new Date().toISOString();
 
+    // ----- บันทึกโปรไฟล์ลง Realtime Database -----
     await db.ref(`users/${uid}`).set({
       firstName,
       lastName,
       gender,
       dateOfBirth,
       email,
-      // 🔁 เปลี่ยนจาก pending -> active (หรือจะไม่ใช้ field นี้ก็ได้)
-      status: 'active',
+      status: 'pending',        // ✅ ยัง "สมัครไม่สมบูรณ์" จนกว่าจะยืนยันอีเมล
       role: 'user',
+      emailVerified: false,
       createdAt: now,
     });
 
+    // ----- ส่งอีเมลยืนยัน -----
+    const apiKey = process.env.FIREBASE_API_KEY;
+    if (!apiKey) {
+      console.error('FIREBASE_API_KEY is missing in .env');
+      return res.status(201).json({
+        message:
+          'สมัครเกือบสำเร็จแล้ว แต่ยังไม่ได้ส่งอีเมลยืนยัน เนื่องจากยังไม่ได้ตั้งค่า FIREBASE_API_KEY',
+        uid,
+      });
+    }
+
+    // 1) sign-in เพื่อขอ idToken (ใช้ email/password ที่เพิ่งสมัคร)
+    const signInUrl = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`;
+
+    const signInRes = await axios.post(signInUrl, {
+      email,
+      password,
+      returnSecureToken: true,
+    });
+
+    const idToken = signInRes.data.idToken;
+
+    // 2) เรียก sendOobCode แบบ VERIFY_EMAIL
+    const sendOobUrl = `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${apiKey}`;
+
+    await axios.post(sendOobUrl, {
+      requestType: 'VERIFY_EMAIL',
+      idToken,
+    });
+
     return res.status(201).json({
-      // 🔁 เปลี่ยนข้อความเป็นใช้งานได้เลย
-      message: 'สมัครสมาชิกสำเร็จ คุณสามารถเข้าสู่ระบบได้ทันที',
+      message:
+        'สมัครเกือบสำเร็จแล้ว! ระบบได้ส่งอีเมลให้คุณยืนยันแล้ว กรุณาคลิกปุ่มยืนยันในอีเมลเพื่อเปิดใช้งานบัญชี',
       uid,
     });
   } catch (err) {
-    console.error('Register error:', err);
+    console.error('Register error:', err?.response?.data || err);
 
-    // ถ้า email ซ้ำ
     if (err.code === 'auth/email-already-exists') {
       return res.status(400).json({ message: 'อีเมลนี้ถูกใช้สมัครแล้ว' });
     }
@@ -101,8 +121,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// 2) ล็อกอิน
-// POST /api/login
+// 2) ล็อกอิน (อนุญาตเฉพาะผู้ที่ยืนยันอีเมลแล้วเท่านั้น)
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -117,7 +136,9 @@ app.post('/api/login', async (req, res) => {
 
     const apiKey = process.env.FIREBASE_API_KEY;
     if (!apiKey) {
-      return res.status(500).json({ message: 'ยังไม่ได้ตั้งค่า FIREBASE_API_KEY ใน .env' });
+      return res
+        .status(500)
+        .json({ message: 'ยังไม่ได้ตั้งค่า FIREBASE_API_KEY ใน .env' });
     }
 
     // ----- ใช้ Firebase Auth REST API เช็ค email/password -----
@@ -131,6 +152,21 @@ app.post('/api/login', async (req, res) => {
 
     const { idToken, localId: uid } = response.data;
 
+    // ----- ดึงข้อมูลบัญชีเพื่อตรวจว่า emailVerified หรือยัง -----
+    const lookupUrl = `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`;
+
+    const accountInfoRes = await axios.post(lookupUrl, { idToken });
+    const userInfo = accountInfoRes.data.users && accountInfoRes.data.users[0];
+    const emailVerified = userInfo?.emailVerified || false;
+
+    if (!emailVerified) {
+      // ยังไม่ยืนยันอีเมล → ห้ามเข้า
+      return res.status(403).json({
+        message:
+          'บัญชียังไม่ได้ยืนยันอีเมล กรุณาเปิดกล่องจดหมายและคลิกปุ่มยืนยันในอีเมลก่อนเข้าสู่ระบบ',
+      });
+    }
+
     // ----- อ่านโปรไฟล์จาก Realtime Database -----
     const snapshot = await db.ref(`users/${uid}`).once('value');
     const profile = snapshot.val();
@@ -139,24 +175,25 @@ app.post('/api/login', async (req, res) => {
       return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ใช้ในฐานข้อมูล' });
     }
 
-    // ❌ ลบส่วนเช็ค pending / declined ออก
-    // if (profile.status === 'pending') {
-    //   return res.status(403).json({ message: 'บัญชีของคุณกำลังรอการอนุมัติจากผู้ดูแลระบบ' });
-    // }
-    // if (profile.status === 'declined') {
-    //   return res.status(403).json({ message: 'บัญชีของคุณไม่ได้รับอนุมัติการเข้าใช้งาน' });
-    // }
+    // ถ้าใน DB ยังเป็น pending แต่ emailVerified แล้ว → อัพเดตเป็น active
+    if (profile.status === 'pending') {
+      await db.ref(`users/${uid}`).update({
+        status: 'active',
+        emailVerified: true,
+      });
+      profile.status = 'active';
+      profile.emailVerified = true;
+    }
 
     // ----- ล็อกอินสำเร็จ -----
     return res.json({
       message: 'เข้าสู่ระบบสำเร็จ',
-      token: idToken, // token นี้ใช้เรียก API อื่นต่อได้ถ้าต้องการ
+      token: idToken,
       profile,
     });
   } catch (err) {
     console.error('Login error:', err?.response?.data || err);
 
-    // error จาก Firebase Auth REST
     if (err.response && err.response.data && err.response.data.error) {
       const errorCode = err.response.data.error.message;
 
@@ -174,7 +211,6 @@ app.post('/api/login', async (req, res) => {
 });
 
 // 3) ขอ reset password
-// POST /api/forgot-password
 app.post('/api/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
@@ -189,7 +225,9 @@ app.post('/api/forgot-password', async (req, res) => {
 
     const apiKey = process.env.FIREBASE_API_KEY;
     if (!apiKey) {
-      return res.status(500).json({ message: 'ยังไม่ได้ตั้งค่า FIREBASE_API_KEY ใน .env' });
+      return res
+        .status(500)
+        .json({ message: 'ยังไม่ได้ตั้งค่า FIREBASE_API_KEY ใน .env' });
     }
 
     const url = `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${apiKey}`;
@@ -200,7 +238,8 @@ app.post('/api/forgot-password', async (req, res) => {
     });
 
     return res.json({
-      message: 'ระบบได้ส่งอีเมลสำหรับตั้งรหัสผ่านใหม่ให้แล้ว (ถ้ามีอีเมลนี้ในระบบ)',
+      message:
+        'ระบบได้ส่งอีเมลสำหรับตั้งรหัสผ่านใหม่ให้แล้ว (ถ้ามีอีเมลนี้ในระบบ)',
     });
   } catch (err) {
     console.error('Forgot password error:', err?.response?.data || err);
