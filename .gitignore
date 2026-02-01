@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# env
+.env
+
+# firebase / secrets
+firebase-service-account.json
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
