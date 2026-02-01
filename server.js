@@ -8,19 +8,34 @@ const admin = require('firebase-admin');
 const app = express();
 
 // -------------------- Firebase Admin Init --------------------
-// แก้ไข: ใช้ Environment Variables แทนการอ่านไฟล์ JSON เพื่อความปลอดภัยบน Vercel
-const serviceAccount = {
+// ระบบจะดึงค่าจาก Environment Variables ใน Vercel Dashboard
+const firebaseConfig = {
   projectId: process.env.FIREBASE_PROJECT_ID,
   clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-  // จัดการเรื่องขึ้นบรรทัดใหม่ของ Private Key
+  // จัดการเรื่องการขึ้นบรรทัดใหม่ (\n) ของ Private Key ให้ถูกต้อง
   privateKey: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined,
+  databaseURL: process.env.FIREBASE_DB_URL
 };
 
+// ตรวจสอบความพร้อมของตัวแปร (ช่วย Debug ใน Vercel Logs)
+if (!firebaseConfig.projectId || !firebaseConfig.clientEmail || !firebaseConfig.privateKey) {
+  console.error("❌ ขาดการตั้งค่า Environment Variables: โปรดตรวจสอบหน้า Settings ใน Vercel");
+}
+
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: process.env.FIREBASE_DB_URL
-  });
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: firebaseConfig.projectId,
+        clientEmail: firebaseConfig.clientEmail,
+        privateKey: firebaseConfig.privateKey,
+      }),
+      databaseURL: firebaseConfig.databaseURL
+    });
+    console.log("✅ Firebase Admin Initialized Successfully");
+  } catch (error) {
+    console.error("❌ Firebase Init Error:", error.message);
+  }
 }
 
 const db = admin.database();
@@ -40,8 +55,9 @@ function isStrongPassword(password) {
 
 // -------------------- Routes --------------------
 
+// หน้าแรกสำหรับเช็คว่า Server รันอยู่ไหม
 app.get('/', (req, res) => {
-  res.send('PM Auth Backend is running on Vercel!');
+  res.status(200).send('PM Auth Backend is active and running on Vercel!');
 });
 
 // 1) สมัครสมาชิก
@@ -105,7 +121,7 @@ app.post('/api/login', async (req, res) => {
 
     const apiKey = process.env.FIREBASE_API_KEY;
     if (!apiKey) {
-      return res.status(500).json({ message: 'เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า API Key' });
+      return res.status(500).json({ message: 'ยังไม่ได้ตั้งค่า FIREBASE_API_KEY' });
     }
 
     const signInUrl = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`;
@@ -120,7 +136,7 @@ app.post('/api/login', async (req, res) => {
     const profile = snapshot.val();
 
     if (!profile) {
-      return res.status(404).json({ message: 'ไม่พบข้อมูลผู้ใช้ในฐานข้อมูล' });
+      return res.status(404).json({ message: 'ไม่พบข้อมูลโปรไฟล์ผู้ใช้' });
     }
 
     return res.json({
@@ -156,9 +172,10 @@ app.post('/api/forgot-password', async (req, res) => {
       message: 'ระบบได้ส่งอีเมลสำหรับตั้งรหัสผ่านใหม่ให้แล้ว (ถ้ามีอีเมลนี้ในระบบ)',
     });
   } catch (err) {
+    console.error('Forgot password error:', err?.response?.data || err);
     return res.status(500).json({ message: 'เกิดข้อผิดพลาดจากเซิร์ฟเวอร์' });
   }
 });
 
-// สำคัญ: สำหรับ Vercel เราจะ export app แทนการใช้ app.listen
+// ส่งออก app เพื่อให้ Vercel จัดการต่อ
 module.exports = app;
